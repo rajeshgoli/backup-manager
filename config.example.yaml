@@ -1,0 +1,22 @@
+backup_dir: ~/Library/CloudStorage/GoogleDrive-you@gmail.com/My Drive/Backups/encrypted-state
+checkpoint_interval_days: 7
+keep_checkpoints: 2
+
+sources:
+  # Explicit file list
+  my-secrets:
+    files:
+      - ~/projects/myapp/config/credentials.yaml
+      - ~/projects/myapp/.env.local
+
+  # Glob-based directory scan
+  my-databases:
+    path: ~/projects/myapp/data/
+    include: ["*.db", "*.sqlite"]
+
+  # Both together
+  mixed-source:
+    files:
+      - ~/projects/other/config.yaml
+    path: ~/projects/other/local_data/
+    include: ["client_secret_*"]
