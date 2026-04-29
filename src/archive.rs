@@ -153,13 +153,12 @@ pub fn decrypt_to_bytes(encrypted_path: &Path, passphrase: &str) -> Result<Vec<u
 }
 
 /// Copy a file to a local temp file to avoid FUSE filesystem issues
-/// (Google Drive FileStream returns EDEADLK on cloud-only files).
+/// (Google Drive FileStream returns EDEADLK on cloud-only files). Streams
+/// via std::fs::copy so multi-GB archives aren't buffered into memory.
 fn stage_locally(path: &Path) -> Result<NamedTempFile> {
-    let mut tmp = NamedTempFile::new().context("creating temp file for staging")?;
-    let data = retry_on_deadlock(|| std::fs::read(path))
+    let tmp = NamedTempFile::new().context("creating temp file for staging")?;
+    retry_on_deadlock(|| std::fs::copy(path, tmp.path()).map(|_| ()))
         .with_context(|| format!("reading {} (is Google Drive online?)", path.display()))?;
-    tmp.write_all(&data).context("writing to temp file")?;
-    tmp.flush()?;
     Ok(tmp)
 }
 
