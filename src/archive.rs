@@ -172,8 +172,9 @@ where
     for (i, delay) in delays.iter().enumerate() {
         match op() {
             Ok(v) => return Ok(v),
-            // EDEADLK = 11 on macOS/Linux; Google Drive FileStream returns it transiently.
-            Err(e) if e.raw_os_error() == Some(11) => {
+            // Google Drive FileStream returns EDEADLK transiently on cloud-only files.
+            // EDEADLK is 11 on macOS but 35 on Linux, so use the platform constant.
+            Err(e) if e.raw_os_error() == Some(libc::EDEADLK) => {
                 eprintln!(
                     "  warn: filesystem deadlock (attempt {}/{}), retrying in {}s...",
                     i + 1,

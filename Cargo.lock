@@ -83,6 +83,7 @@ dependencies = [
  "clap",
  "dirs",
  "glob",
+ "libc",
  "rand",
  "rpassword",
  "serde",
