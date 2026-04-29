@@ -4,6 +4,7 @@ use bzip2::Compression;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use tempfile::NamedTempFile;
 
 pub fn create_archive(files: &[PathBuf], output_path: &Path, passphrase: &str) -> Result<u64> {
     // Build tar → bzip2 in memory
@@ -48,7 +49,12 @@ fn encrypt_and_write(data: &[u8], output_path: &Path, passphrase: &str) -> Resul
             .with_context(|| format!("creating directory: {}", parent.display()))?;
     }
 
-    let out_str = output_path.to_string_lossy().to_string();
+    // Write to a local temp file first, then copy to final destination.
+    // This avoids GPG writing directly to FUSE mounts (Google Drive) which
+    // can fail with broken pipe or EDEADLK on cloud-only files.
+    let tmp = NamedTempFile::new().context("creating temp file for gpg output")?;
+    let tmp_path = tmp.path().to_string_lossy().to_string();
+
     let mut child = Command::new("gpg")
         .args([
             "--symmetric",
@@ -59,7 +65,7 @@ fn encrypt_and_write(data: &[u8], output_path: &Path, passphrase: &str) -> Resul
             "--passphrase",
             passphrase,
             "--output",
-            &out_str,
+            &tmp_path,
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -79,6 +85,10 @@ fn encrypt_and_write(data: &[u8], output_path: &Path, passphrase: &str) -> Resul
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    retry_on_deadlock(|| std::fs::copy(tmp.path(), output_path).map(|_| ()))
+        .with_context(|| format!("copying encrypted file to {}", output_path.display()))?;
+
     Ok(())
 }
 
@@ -86,6 +96,9 @@ pub fn decrypt_file(encrypted_path: &Path, output_path: &Path, passphrase: &str)
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+
+    // Stage encrypted file locally first to avoid FUSE read errors
+    let local_src = stage_locally(encrypted_path)?;
 
     let output = Command::new("gpg")
         .args([
@@ -96,7 +109,7 @@ pub fn decrypt_file(encrypted_path: &Path, output_path: &Path, passphrase: &str)
             passphrase,
             "--output",
             &output_path.to_string_lossy(),
-            &encrypted_path.to_string_lossy(),
+            &local_src.path().to_string_lossy(),
         ])
         .output()
         .context("running gpg decrypt")?;
@@ -115,6 +128,9 @@ pub fn encrypt_json(data: &[u8], output_path: &Path, passphrase: &str) -> Result
 }
 
 pub fn decrypt_to_bytes(encrypted_path: &Path, passphrase: &str) -> Result<Vec<u8>> {
+    // Stage encrypted file locally first to avoid FUSE read errors
+    let local_src = stage_locally(encrypted_path)?;
+
     let output = Command::new("gpg")
         .args([
             "--decrypt",
@@ -122,7 +138,7 @@ pub fn decrypt_to_bytes(encrypted_path: &Path, passphrase: &str) -> Result<Vec<u
             "--yes",
             "--passphrase",
             passphrase,
-            &encrypted_path.to_string_lossy(),
+            &local_src.path().to_string_lossy(),
         ])
         .output()
         .context("running gpg decrypt")?;
@@ -134,4 +150,41 @@ pub fn decrypt_to_bytes(encrypted_path: &Path, passphrase: &str) -> Result<Vec<u
         );
     }
     Ok(output.stdout)
+}
+
+/// Copy a file to a local temp file to avoid FUSE filesystem issues
+/// (Google Drive FileStream returns EDEADLK on cloud-only files).
+fn stage_locally(path: &Path) -> Result<NamedTempFile> {
+    let mut tmp = NamedTempFile::new().context("creating temp file for staging")?;
+    let data = retry_on_deadlock(|| std::fs::read(path))
+        .with_context(|| format!("reading {} (is Google Drive online?)", path.display()))?;
+    tmp.write_all(&data).context("writing to temp file")?;
+    tmp.flush()?;
+    Ok(tmp)
+}
+
+/// Retry a filesystem operation on EDEADLK (os error 11), which Google Drive
+/// FileStream returns transiently on cloud-only files. Backoff: 1s, 2s, 5s, 10s, 20s.
+fn retry_on_deadlock<T, F>(mut op: F) -> std::io::Result<T>
+where
+    F: FnMut() -> std::io::Result<T>,
+{
+    let delays = [1, 2, 5, 10, 20];
+    for (i, delay) in delays.iter().enumerate() {
+        match op() {
+            Ok(v) => return Ok(v),
+            // EDEADLK = 11 on macOS/Linux; Google Drive FileStream returns it transiently.
+            Err(e) if e.raw_os_error() == Some(11) => {
+                eprintln!(
+                    "  warn: filesystem deadlock (attempt {}/{}), retrying in {}s...",
+                    i + 1,
+                    delays.len() + 1,
+                    delay
+                );
+                std::thread::sleep(std::time::Duration::from_secs(*delay));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    op()
 }
